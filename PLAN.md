@@ -1,12 +1,23 @@
-# Timetabling App: Plan
+# Timetabling App: Final Plan
 
 ## Goal
 
-A personal timetable where you:
+A personal timetable app for your phone (a desktop version comes later) where you:
 
-1. **Block out busy time.** Draw blocks on a weekly calendar for times you're not free (lectures, work, sleep, gym) and label them. Blocks can repeat weekly.
-2. **Add tasks.** Type a task with a **name**, **how long it takes**, and **when it's due**.
-3. **Get it scheduled automatically.** The app finds free time before the deadline and places the task there, splitting it into chunks if needed. If it can't fit, the app tells you.
+1. **Block out busy time.** Add labelled blocks for times you're not free, such as "Maths lecture", "Work" or "Sleep". Blocks can be one-off or repeating.
+2. **Set up routines.** Create recurring blocks in one step, for example "Work, Mon–Fri, 9:00–17:00".
+3. **Add tasks.** Type a task with a name, how long it takes, and when it's due.
+4. **Get it scheduled automatically.** The app places each task as early as reasonably possible before its deadline. It decides by itself whether to split a task into chunks, and it reshuffles everything when your plans change.
+
+## Decisions made
+
+| Question | Decision |
+|---|---|
+| Platform | **Phone app first** (iOS and Android). Desktop comes later and reuses the same code. |
+| Default hours | **None.** The app starts with no assumed working or sleeping hours. You add your own with the **Routines** feature. |
+| Splitting | **Decided automatically** by the scheduler's rules (see below). You can override it for a single task if you want. |
+| Placement | **As early as reasonably possible**, so later free time stays open for emergencies. |
+| Storage | **On-device only** for v1. No account and no sync. |
 
 ---
 
@@ -14,123 +25,165 @@ A personal timetable where you:
 
 | Concern | Choice | Why |
 |---|---|---|
-| App type | Single-page web app (runs in the browser, works on a phone) | No install, no server needed to start |
-| Language | TypeScript | Catches date and time mistakes early |
-| UI framework | React + Vite | Fast to build with, simple tooling |
-| Calendar grid | Custom CSS grid (one column per day, rows of 15 minutes) | Full control over drag-to-create and colouring, no heavy dependency |
-| Dates | `date-fns` | Small and reliable date arithmetic |
-| Storage | `localStorage` (v1) | Data stays on your device, no account needed |
-| Tests | Vitest | The scheduler is pure logic and easy to unit test |
+| App framework | **React Native + Expo** (TypeScript) | One codebase for iOS and Android. You can try it on your own phone with the Expo Go app by scanning a QR code. |
+| Navigation | Expo Router | Simple screen-based navigation |
+| Gestures and animation | react-native-gesture-handler + Reanimated | Smooth long-press-and-drag to create blocks |
+| Dates | `date-fns` | Reliable date arithmetic that handles daylight-saving changes |
+| Storage | `expo-sqlite` | Fast, structured, on-device storage |
+| State | Zustand | Lightweight store that reruns the scheduler whenever something changes |
+| Tests | Jest | Unit tests for the scheduler |
+| Desktop (later) | Same code via Expo's web build, wrapped with **Tauri** | The scheduler and most of the UI carry over unchanged |
 
-A backend or sync can come later. Nothing in v1 depends on one.
+The scheduler is plain TypeScript with no phone-specific code, so the desktop app reuses it as-is.
 
 ---
 
 ## Data model
 
 ```ts
-// Time you are NOT available
+// Time you are NOT available (one-off, or one occurrence of a routine)
 interface BusyBlock {
   id: string;
-  label: string;            // "Maths lecture", "Work", "Sleep"
-  start: string;            // ISO datetime
-  end: string;              // ISO datetime
-  repeat: 'none' | 'weekly';
-  repeatUntil?: string;     // optional end date for weekly repeats
+  label: string;              // "Dentist", "Maths lecture"
+  start: string;              // ISO datetime
+  end: string;
   color: string;
+  routineId?: string;         // set if this block comes from a routine
+}
+
+// Recurring busy time, e.g. "Work, Mon–Fri, 9:00–17:00"
+interface Routine {
+  id: string;
+  label: string;
+  days: number[];             // 0 = Sun … 6 = Sat, e.g. [1,2,3,4,5]
+  startTime: string;          // "09:00"
+  endTime: string;            // "17:00" (may cross midnight, e.g. Sleep 23:00–07:00)
+  color: string;
+  activeFrom: string;         // date
+  activeUntil?: string;       // optional end date (e.g. end of term)
+  skipDates: string[];        // single occurrences removed (e.g. a day off)
 }
 
 // Something you need to do
 interface Task {
   id: string;
-  title: string;            // "Write history essay"
-  durationMinutes: number;  // total time needed
-  deadline: string;         // ISO datetime: must be finished by this
-  earliestStart?: string;   // optional: "don't start before"
-  splittable: boolean;      // may be broken into chunks?
-  minChunkMinutes: number;  // smallest chunk worth doing (default 30)
-  priority: 'low' | 'normal' | 'high';
+  title: string;
+  durationMinutes: number;
+  deadline: string;           // must be finished by this time
+  earliestStart?: string;     // optional "not before"
+  priority: 'normal' | 'high';
+  splitOverride?: 'one-sitting' | 'allow-split';  // normally empty: the app decides
+  minutesDone: number;        // progress, so partially done tasks reschedule correctly
   done: boolean;
 }
 
-// Output of the scheduler (computed, not typed in)
+// Output of the scheduler (computed, never typed in)
 interface ScheduledChunk {
   taskId: string;
   start: string;
   end: string;
-  locked: boolean;          // you pinned it, so the scheduler won't move it
+  locked: boolean;            // pinned by you, so the scheduler won't move it
 }
 
 interface Settings {
-  dayStart: string;         // e.g. "08:00": never schedule tasks before
-  dayEnd: string;           // e.g. "22:00": never schedule tasks after
-  slotMinutes: 15;          // grid granularity
-  bufferMinutes: number;    // gap kept around tasks (default 10)
-  maxChunkMinutes: number;  // longest single sitting (default 120)
+  bufferMinutes: number;      // gap kept between items (default 10)
+  leadTimeMinutes: number;    // don't schedule anything starting sooner than this from now (default 15)
 }
 ```
 
-**Key idea:** busy blocks and tasks are what you enter. The schedule is **derived** from them, so it is recalculated whenever anything changes. Only chunks you lock are kept fixed.
+**Key idea:** busy blocks, routines and tasks are what you enter. The schedule is **derived** from them and recalculated whenever anything changes. Only chunks you lock stay fixed.
 
 ---
 
-## The auto-scheduling algorithm
+## The Routines feature (setting your own default hours)
 
-Run every time a block, task or setting changes:
+- A **Routines** screen lists your recurring blocks: "Work Mon–Fri 9–5", "Sleep every day 23:00–07:00", "Football Wed 18–20".
+- **Creating one:** enter a label, tap the days you want (with shortcuts for *Weekdays*, *Weekends* and *Every day*), pick start and end times, choose a colour, and optionally set an end date.
+- **Editing a routine** updates every future occurrence. Tapping a single occurrence on the calendar offers "Skip this one" (for example a bank holiday) or "Edit only this one".
+- **First launch:** an optional welcome screen suggests adding routines such as sleep and work. **Nothing is pre-filled.** If you skip it, every hour of the day counts as free.
 
-1. **Build the free-time map** from now until the latest deadline:
-   - Start with each day's working window (`dayStart` to `dayEnd`).
-   - Subtract every busy block, with weekly repeats expanded into individual occurrences.
-   - Subtract locked chunks.
-   - The result is a sorted list of free intervals.
-2. **Order the tasks** that aren't done by:
-   1. deadline, earliest first (Earliest-Deadline-First is the classic rule that best avoids missed deadlines)
-   2. priority, high first
-   3. duration, longest first (big tasks get first pick of large gaps)
-3. **Place each task** by walking the free intervals from `max(now, earliestStart)` up to `deadline`:
-   - **Not splittable:** take the first gap that fits the whole duration plus buffers.
-   - **Splittable:** fill gaps in chunks between `minChunkMinutes` and `maxChunkMinutes` until the duration is covered.
-   - Snap every start and end to the 15-minute grid.
-   - Remove the used time (plus buffer) from the free map so later tasks can't overlap.
-4. **Report anything that doesn't fit:** a task that can't be fully placed before its deadline gets an "⚠ Can't fit, short by 1h 30m" warning, and its partial chunks are still shown.
-
-The scheduler is a **pure function**, `schedule(blocks, tasks, settings, now) → { chunks, warnings }`, so it is easy to test and has no UI dependencies.
-
-### Possible later upgrades
-- **Spread work out:** prefer placing chunks on different days instead of cramming everything early.
-- **Preferred times:** for example "deep work in the morning".
-- **Smarter packing:** a look-ahead or backtracking pass when greedy placement fails but a valid arrangement exists.
+> Note: with no routines, the scheduler treats all 24 hours as free and could place a task at 3 a.m. Adding a "Sleep" routine prevents that. This is your choice to make; nothing is assumed.
 
 ---
 
-## Screens and UI
+## Auto-scheduling algorithm
 
-1. **Week view (main screen)**
-   - 7 columns × time rows with a "now" line.
-   - **Click and drag** on empty space to create a busy block. A popup asks for a label, colour and whether it repeats weekly.
-   - Busy blocks are solid colour. Scheduled task chunks are a distinct striped or outlined style so you can tell them apart.
-   - Click a block or chunk to edit, delete, lock, or mark it done.
-   - Arrows to move between weeks, plus a "Today" button.
-2. **Quick-add task bar** at the top:
-   `[ Task name ] [ 2h ] [ due: Fri 17:00 ] [Add]`
-   with an "advanced" toggle for splittable, minimum chunk, priority and earliest start.
-   - Durations are typed naturally: "90m", "1.5h", "2h 30m".
-3. **Task list sidebar**
-   - Every task with its status: ✅ scheduled, ⚠ can't fit, ✔ done.
-   - Shows when each task is planned ("Tue 14:00–15:30, Wed 10:00–10:30").
-4. **Settings panel:** day start and end, buffer, maximum chunk length.
+Runs automatically after any change to tasks, blocks, routines or settings, and whenever the app is opened.
+
+### 1. Build the free-time map
+- Start from **now plus the lead time**, rounded up to the next 15 minutes, and go up to the latest deadline.
+- Expand routines into concrete occurrences in that range, then subtract them along with one-off blocks and locked chunks.
+- Merge overlapping busy time. The result is a sorted list of free gaps.
+
+### 2. Order the tasks
+Tasks are placed one at a time in this order:
+1. **Earliest deadline first.** This is the standard rule that best avoids missed deadlines.
+2. **High priority** before normal when deadlines are close.
+3. **Longest task first** when there is a tie, so big tasks get first pick of large gaps.
+
+### 3. Decide automatically whether to split
+For each task, the scheduler picks **whichever valid option finishes the task earliest**, using these rules:
+
+| Rule | Behaviour |
+|---|---|
+| Short tasks (**≤ 60 min**) | Always one sitting. Splitting something that short isn't worth it. |
+| Medium tasks (**61–150 min**) | One sitting if a gap that fits exists before the deadline and finishing that way is **no more than about a day later** than the split option. Otherwise split. |
+| Long tasks (**> 150 min**) | Split into chunks of **45–120 min** each, using as few chunks as possible. |
+| Chunk limits | No chunk shorter than 45 min (except a final leftover of at least 30 min). No chunk longer than 2 h without a gap. |
+| Override | Long-press a task and choose "Keep in one sitting" or "Allow splitting" to overrule the rules. |
+
+These thresholds live in a single config file so they're easy to tune once you've used the app.
+
+### 4. Place as early as reasonably possible
+- Each task or chunk goes into the **earliest free gap** that can hold it, with the buffer applied on both sides.
+- "Reasonably" means:
+  - Nothing is scheduled within the lead time, so a task never lands in the next few minutes.
+  - Buffers keep items from sitting back to back.
+  - The 2-hour chunk limit stops marathon sessions.
+- Used time is removed from the free map so tasks never overlap.
+
+### 5. Report problems
+- If a task can't be fully placed before its deadline, it is marked **"⚠ Can't fit, short by 1h 30m"** and the parts that do fit are still shown.
+- For each task, the app also shows **how much spare time is left before the deadline**, so you can see how much room you have for surprises.
+
+### Handling emergencies and changes
+- **Adding an emergency block** (for example "Hospital, today 14:00–18:00") moves affected tasks to the next earliest free time automatically. A short message summarises what moved, such as "3 tasks rescheduled".
+- **Missed chunks:** if a chunk's time passes and you haven't confirmed it, the app asks "Did you do *Essay* (14:00–15:00)?" with the options **Yes / Partly / No**, then updates progress and reschedules the rest.
+- **Finishing early:** marking a task done frees its remaining time for other tasks.
+
+The scheduler is a **pure function**:
+`schedule(routines, blocks, tasks, lockedChunks, settings, now) → { chunks, warnings }`.
+It has no UI code, so it is fully unit-testable and shared with the future desktop app.
 
 ---
 
-## Edge cases to handle
+## Screens (phone-first)
 
-- A deadline that is already in the past: reject it, or flag it as overdue.
-- A task longer than any single free gap while not splittable: warn and suggest allowing splitting.
-- Overlapping busy blocks: merge them when building the free map.
-- Editing a busy block on top of scheduled tasks: tasks reflow automatically. Locked chunks that conflict get flagged.
-- Time passing: chunks in the past that aren't marked done count as missed, and the remaining work reschedules.
-- Daylight-saving changes: do all date arithmetic with `date-fns` in local time, never by adding raw milliseconds.
-- Marking a task done early frees its remaining chunks for other tasks.
+1. **Calendar (home)**
+   - **Day view** and **3-day view** by default, since 7 columns are too cramped on a phone. A compact **week overview** is available too.
+   - Swipe left or right to change days. A "Today" button and a "now" line.
+   - **Long-press and drag** on empty time to create a busy block, then name it and pick a colour.
+   - Busy blocks are solid colour. Task chunks have a distinct outlined style with a progress tick.
+   - Tap any item to edit, delete, lock or unlock, mark done, or "skip this occurrence".
+2. **Quick-add task** (floating ＋ button)
+   - Fields: `Task name` · `Duration` (accepts "90m", "1.5h", "2h 30m") · `Due` (date and time picker).
+   - An optional "More" section for priority, earliest start and splitting override.
+   - After saving, the app shows where the task landed, for example "Scheduled: Tue 10:00–11:30".
+3. **Tasks list:** all tasks with their status (✅ scheduled · ⚠ can't fit · ✔ done), planned times, and spare time before each deadline.
+4. **Routines:** create and edit recurring blocks, as described above.
+5. **Settings:** buffer, lead time, and export/import a JSON backup.
+
+---
+
+## Edge cases covered
+
+- A deadline in the past or within the lead time is flagged as overdue or unschedulable.
+- A routine that crosses midnight (Sleep 23:00–07:00) is handled correctly.
+- Overlapping blocks and routines are merged.
+- A locked chunk that ends up under a newly added busy block is flagged so you can resolve it.
+- Daylight-saving changes are handled because all arithmetic is in local time via `date-fns`, never raw milliseconds.
+- The app recalculates when reopened, since time has passed while it was closed.
+- With lots of tasks, scheduling only looks as far ahead as the latest deadline so it stays fast.
 
 ---
 
@@ -138,45 +191,44 @@ The scheduler is a **pure function**, `schedule(blocks, tasks, settings, now) �
 
 | Phase | Deliverable | Done when |
 |---|---|---|
-| **1. Scaffold** | Vite + React + TS project, folder structure, Vitest set up | `npm run dev` and `npm test` both work |
-| **2. Scheduler core** | `src/scheduler/` with free-time map, EDF placement, splitting, warnings, plus unit tests | Tests cover: simple fit, split across gaps, can't-fit warning, recurring blocks, buffers, locked chunks |
-| **3. Week view + busy blocks** | Calendar grid, drag-to-create, edit and delete labelled blocks, weekly repeat | Blocks can be added, labelled and repeated |
-| **4. Tasks + auto-slotting** | Quick-add bar, duration parser, task list, chunks drawn on the calendar, live rescheduling | Typing a task makes it appear in free time before its deadline |
-| **5. Persistence + settings** | Save and load from `localStorage`, settings panel | Data survives a page refresh |
-| **6. Polish** | Lock or pin chunks, mark done, missed-chunk handling, mobile layout, colours | Comfortable to use day to day |
-| *Later* | Export and import (.ics or JSON), Google Calendar import, sync across devices, notifications | — |
+| **1. Scaffold** | Expo + TypeScript project, navigation, Jest, folder structure | App opens on your phone via Expo Go; `npm test` runs |
+| **2. Scheduler core** | Free-time map, routine expansion, EDF ordering, automatic split decision, earliest placement, warnings, plus unit tests | Tests pass for: simple fit, split vs one-sitting choice, can't-fit, routines (including overnight), buffers, lead time, locked chunks |
+| **3. Calendar + busy blocks** | Day and 3-day views, swipe navigation, long-press-drag to create, edit and delete | You can block out labelled time on your phone |
+| **4. Routines** | Routines screen, weekday shortcuts, skip and edit single occurrences | "Work Mon–Fri 9–5" fills the calendar in one step |
+| **5. Tasks + auto-slotting** | Quick-add, duration parser, task list, chunks on the calendar, live rescheduling, "moved N tasks" message | Adding a task makes it appear in the earliest sensible free time |
+| **6. Persistence** | SQLite storage, JSON export/import | Everything survives closing the app |
+| **7. Real-life handling** | Missed-chunk check-ins (Yes/Partly/No), locking, mark done, spare-time display | Usable day to day, recovers gracefully from disruptions |
+| **8. Polish + release build** | Colours, dark mode, empty states, app icon, installable build via Expo EAS | Installed on your phone like a normal app |
+| *Later: Desktop* | Expo web build wrapped in Tauri for Windows and macOS, reusing the scheduler | Same timetable on your computer |
+| *Later: Extras* | Sync between phone and desktop, notifications ("Essay starts in 10 min"), calendar import (.ics) | — |
 
 ---
 
-## Proposed folder structure
+## Folder structure
 
 ```
+app/                       # screens (Expo Router)
+  index.tsx                # calendar (home)
+  tasks.tsx
+  routines.tsx
+  settings.tsx
 src/
-  scheduler/
-    freeTime.ts        # build free intervals from settings and busy blocks
-    recurrence.ts      # expand weekly blocks into occurrences
-    schedule.ts        # EDF placement and splitting, returns chunks and warnings
-    schedule.test.ts
+  scheduler/               # pure TypeScript, shared with desktop later
+    config.ts              # split thresholds, chunk sizes
+    routines.ts            # expand routines into occurrences
+    freeTime.ts            # build free-gap map
+    splitDecision.ts       # one sitting vs chunks
+    schedule.ts            # ordering + earliest placement + warnings
+    __tests__/
   lib/
-    parseDuration.ts   # "1h 30m" → 90
-    storage.ts         # localStorage load and save
-  components/
-    WeekView.tsx
-    BusyBlockEditor.tsx
-    TaskQuickAdd.tsx
-    TaskList.tsx
-    SettingsPanel.tsx
+    parseDuration.ts       # "1h 30m" → 90
+    db.ts                  # SQLite load and save
   state/
-    store.ts           # app state; runs the scheduler on change
-  App.tsx
+    store.ts               # Zustand store; reruns scheduler on change
+  components/
+    DayColumn.tsx
+    BlockEditor.tsx
+    TaskQuickAdd.tsx
+    RoutineEditor.tsx
+    MissedChunkPrompt.tsx
 ```
-
----
-
-## Open questions
-
-1. **Platform:** is a web app (works on laptop and phone browser) right, or do you want a native phone app or desktop app?
-2. **Working hours:** what default window should tasks be placed in (for example 08:00–22:00)?
-3. **Splitting:** should tasks split into chunks by default, or stay in one sitting unless you say otherwise?
-4. **Placement style:** schedule tasks as early as possible, or spread them out evenly before the deadline?
-5. **Sync:** is it fine for data to stay on one device for v1?
