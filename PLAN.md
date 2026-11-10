@@ -189,6 +189,8 @@ It has no UI code, so it is fully unit-testable and shared with the future deskt
 
 ## Build phases
 
+> **Status (prototype):** phases 1–5 and 7 are working, and phase 6 is partly done. See "Prototype notes" below.
+
 | Phase | Deliverable | Done when |
 |---|---|---|
 | **1. Scaffold** | Expo + TypeScript project, navigation, Jest, folder structure | App opens on your phone via Expo Go; `npm test` runs |
@@ -232,3 +234,17 @@ src/
     RoutineEditor.tsx
     MissedChunkPrompt.tsx
 ```
+
+---
+
+## Prototype notes
+
+What's built, and where it differs from the plan above:
+
+- **Storage:** uses AsyncStorage (a single saved JSON document) instead of SQLite. This is fine at prototype scale. Move to `expo-sqlite` when the data grows.
+- **Navigation:** a simple bottom tab bar instead of Expo Router, to keep the prototype small.
+- **Creating busy time:** you tap an empty half-hour slot, then adjust the time in the editor. Long-press-and-drag comes in the polish phase.
+- **Calendar views:** Day and 3-day views are built. The week overview isn't yet.
+- **Routines:** "active until" end dates are supported by the scheduler but have no editor yet.
+- **Partial check-ins:** "Partly" records half of the session as done. A slider for the exact amount can come later.
+- **Not built yet:** installable release build (EAS), app icon, notifications, desktop app, sync.
